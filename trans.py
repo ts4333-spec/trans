@@ -70,7 +70,7 @@ isbn_input = st.text_input("ISBN 입력", placeholder="예: 9791160261479")
 if st.button("번역자 찾기"):
     if not isbn_input:
         st.warning("ISBN을 입력해주세요!")
-    elif TTB_KEY == "여기에_본인의_알라딘_TTB키를_넣으세요":
+    elif TTB_KEY == "ttbcts43330320002":
         st.error("코드 안에 TTB_KEY를 본인의 발급 키로 변경해주세요!")
     else:
         # 로딩 스피너 보여주기
