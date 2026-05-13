@@ -76,7 +76,7 @@ if submitted:
     
     if not isbn_input:
         st.warning("ISBN을 입력해주세요!")
-    elif TTB_KEY == "여기에_본인의_알라딘_TTB키를_넣으세요":
+    elif TTB_KEY == "ttbcts43330320002":
         st.error("코드 안의 TTB_KEY를 본인의 발급 키로 변경해주세요!")
     else:
         with st.spinner("API 통신 중..."):
