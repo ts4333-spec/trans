@@ -73,7 +73,7 @@ st.title("📚 알라딘 번역자 검색기 (Pro)")
 st.write("ISBN을 입력하면 알라딘 API에서 번역자 정보를 찾아옵니다.")
 
 # ⚠️ 주의: 아래 변수에 본인의 TTB 키를 직접 입력하세요!
-TTB_KEY = "여기에_본인의_알라딘_TTB키를_넣으세요"
+TTB_KEY = "ttbcts43330320002"
 
 isbn_input = st.text_input("ISBN 입력", placeholder="예: 9791160261479")
 
