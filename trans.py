@@ -1,54 +1,57 @@
 import streamlit as st
-import re
+import requests
 
-def extract_translator_from_text(author_str: str) -> list:
-    """
-    알라딘에서 내려주는 지저분한 저자 문자열에서 번역가 이름만 깔끔하게 추출합니다.
-    """
-    translators = []
-    
-    if not author_str:
-        return translators
+st.title("알라딘 번역가 검색")
 
-    # 예: "앤디 위어 (지은이), 강동혁 (옮긴이)" -> 쉼표(,) 기준으로 분리
-    parts = author_str.split(',')
-    
-    for part in parts:
-        # 분리된 조각 안에 번역가를 뜻하는 단어가 있는지 확인
-        if any(keyword in part for keyword in ["옮긴이", "역자", "옮김", "역"]):
-            # 괄호 안의 내용이나 불필요한 단어들을 정규식으로 싹 지움
-            name = re.sub(r"\(.*?\)|옮긴이|역자|옮김|지은이|지음|역", "", part).strip()
-            if name:
-                translators.append(name)
-                
-    return translators
+with st.form("api_form"):
+    # 변수 하드코딩 오류를 막기 위해 UI에서 직접 키를 입력받습니다.
+    ttb_key = st.text_input("알라딘 TTB 키", type="password")
+    isbn = st.text_input("ISBN 입력 (예: 9788925588735)")
+    submit = st.form_submit_button("번역가 검색")
 
-# ==========================================
-# 🎨 스트림릿 UI (API 통신 없음, 오프라인 모드)
-# ==========================================
-
-st.set_page_config(page_title="번역가 추출 테스트", page_icon="✂️")
-
-st.title("✂️ 번역가 이름만 쏙! 추출기")
-st.write("알라딘 API 차단과 상관없이, **텍스트 추출 로직**만 단독으로 테스트하는 화면입니다.")
-
-# 테스트용 예시 데이터 제공
-st.info("💡 **테스트해볼 수 있는 텍스트 예시**\n"
-        "- 앤디 위어 (지은이), 강동혁 (옮긴이)\n"
-        "- 마이클 샌델 지음, 이창신 옮김\n"
-        "- 무라카미 하루키 (지은이), 양억관, 김난주 (옮긴이)")
-
-# 사용자 입력 받기
-sample_text = st.text_input("알라딘 저자 텍스트 입력:", placeholder="예: 앤디 위어 (지은이), 강동혁 (옮긴이)")
-
-if st.button("번역가 추출하기 🚀"):
-    if not sample_text:
-        st.warning("텍스트를 입력해 주세요.")
+if submit:
+    if not ttb_key or not isbn:
+        st.error("TTB 키와 ISBN을 모두 입력해주세요.")
     else:
-        # API 통신 없이 순수하게 파이썬 함수만 실행
-        result = extract_translator_from_text(sample_text)
+        isbn_clean = isbn.replace("-", "").strip()
+        url = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
+        params = {
+            "ttbkey": ttb_key.strip(),
+            "itemIdType": "ISBN13" if len(isbn_clean) == 13 else "ISBN",
+            "ItemId": isbn_clean,
+            "output": "js",
+            "Version": "20131101",
+            "OptResult": "authors"
+        }
         
-        if result:
-            st.success(f"🎉 추출 성공! 찾은 번역가: **{', '.join(result)}**")
-        else:
-            st.error("입력하신 텍스트에서는 번역가를 찾을 수 없습니다.")
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            data = res.json()
+            
+            # API 에러 확인
+            if "errorCode" in data:
+                st.error(f"API 에러: {data.get('errorMessage')}")
+            else:
+                items = data.get("item", [])
+                if not items:
+                    st.warning("해당 ISBN의 도서 정보가 없습니다.")
+                else:
+                    item = items[0]
+                    translators = []
+                    
+                    # subInfo에서 번역가 추출
+                    authors_list = item.get("subInfo", {}).get("authors", [])
+                    for auth in authors_list:
+                        role = auth.get("authorTypeDesc", "") or auth.get("authorTypeName", "")
+                        if "옮긴이" in role or "역자" in role or "역" in role or "옮김" in role:
+                            name = auth.get("authorName", "").strip()
+                            if name:
+                                translators.append(name)
+                                
+                    if translators:
+                        st.success(f"번역가: {', '.join(translators)}")
+                    else:
+                        st.warning("이 책에는 번역가 정보가 없습니다.")
+                        
+        except Exception as e:
+            st.error(f"통신 에러: {str(e)}")
