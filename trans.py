@@ -1,29 +1,76 @@
 """
-알라딘 TTB: ISBN으로 역자 식별(ItemLookUp, 역자 Author ID) → ItemSearch QueryType=Author 로
-역자명 기준 최대 50권 커리어 → 카테고리 교차 필터·출판사 가중 → 원제/언어 휴리스틱.
-(알라딘 API에는 '역자 전용' 검색 타입이 없어 인물 검색은 QueryType=Author + 역자 표기명을 사용.)
-역자 소개: Regex → (선택) LLM JSON 구조화.
+알라딘 TTB: ISBN → 역자 식별(ItemLookUp) → 역자명 ItemSearch(최대 50권, OptResult=authors)
+→ is_translator_role + (선택) 대분류 카테고리 일치 → 원제·커리어 힌트 → 최종 원서 언어 판정.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 import requests
 import streamlit as st
 
+# ---------------------------------------------------------------------------
+# 설정 · 상수
+# ---------------------------------------------------------------------------
+
 ITEM_LOOKUP = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
 ITEM_SEARCH = "http://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
 API_VERSION = "20131101"
-# 부가정보: authors(역할/ID), 카테고리 트리, 책소개 등 — 응답에 biography류 키가 있으면 파싱
 OPT_LOOKUP = "authors,categoryIdList,fulldescription,Story,toc"
+OPT_SEARCH = "authors"
 
-# 출판사 일치 시 통계 가중 (동명이인·언어 추론용)
 PUBLISHER_WEIGHT = 8.0
 
-# --- 알라딘 호출 ---
+# ItemLookUp 역자 추출용 (역할 표기 다양성)
+TRANSLATOR_ROLE_STRICT = ("옮긴이", "역자", "옮김", "번역")
+
+
+def _role_is_translator(role: str) -> bool:
+    r = (role or "").strip()
+    if not r:
+        return False
+    if any(m in r for m in TRANSLATOR_ROLE_STRICT):
+        return True
+    if "역" in r and not any(x in r for x in ("지은이", "지음", "감수", "교정", "편집")):
+        return True
+    return False
+
+
+# 역자 커리어 필터: 사용자 지정 역할 키워드만 사용
+_TRANSLATOR_MARKERS_FOR_CATALOG = ("옮긴이", "역자", "역", "옮김")
+
+
+def _author_name_equals_target(target: str, author_name: str) -> bool:
+    return target.strip() == (author_name or "").strip()
+
+
+def is_translator_role(book: dict, target_name: str) -> bool:
+    """
+    subInfo.authors에서 target_name과 이름이 일치하고,
+    authorTypeDesc 또는 authorTypeName에 옮긴이/역자/역/옮김 중 하나가 포함되면 True.
+    """
+    for auth in (book.get("subInfo") or {}).get("authors") or []:
+        if not isinstance(auth, dict):
+            continue
+        if not _author_name_equals_target(target_name, (auth.get("authorName") or "")):
+            continue
+        desc = (auth.get("authorTypeDesc") or "") + ""
+        name_t = (auth.get("authorTypeName") or "") + ""
+        role_blob = f"{desc} {name_t}"
+        if any(marker in role_blob for marker in _TRANSLATOR_MARKERS_FOR_CATALOG):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 알라딘 API
+# ---------------------------------------------------------------------------
 
 
 def _get_json(url: str, params: dict, timeout: int = 15) -> dict:
@@ -45,8 +92,9 @@ def item_lookup(isbn_clean: str, ttbkey: str, opt_result: str = OPT_LOOKUP) -> d
     return _get_json(ITEM_LOOKUP, params)
 
 
-def item_search_translator_catalog(translator_display_name: str, ttbkey: str, max_results: int = 50) -> dict:
-    """역자(번역가) 참여 도서 목록. 알라딘은 QueryType=Author 로 인물명 검색만 제공."""
+def item_search_translator_catalog(
+    translator_display_name: str, ttbkey: str, max_results: int = 50
+) -> dict:
     params = {
         "ttbkey": ttbkey.strip(),
         "QueryType": "Author",
@@ -56,11 +104,26 @@ def item_search_translator_catalog(translator_display_name: str, ttbkey: str, ma
         "SearchTarget": "Book",
         "output": "js",
         "Version": API_VERSION,
+        "OptResult": OPT_SEARCH,
     }
     return _get_json(ITEM_SEARCH, params)
 
 
-# --- 역자(번역가) / 역자 Author ID ---
+def item_lookup_minimal(isbn13: str, ttbkey: str) -> dict:
+    params = {
+        "ttbkey": ttbkey.strip(),
+        "itemIdType": "ISBN13",
+        "ItemId": isbn13.replace("-", "").strip(),
+        "output": "js",
+        "Version": API_VERSION,
+        "OptResult": "authors",
+    }
+    return _get_json(ITEM_LOOKUP, params)
+
+
+# ---------------------------------------------------------------------------
+# 역자 식별 · 저자 페이지 URL
+# ---------------------------------------------------------------------------
 
 
 def aladin_author_page_url(author_id: Optional[int]) -> Optional[str]:
@@ -70,7 +133,6 @@ def aladin_author_page_url(author_id: Optional[int]) -> Optional[str]:
 
 
 def _author_dict_extra_link(auth: dict) -> Optional[str]:
-    """API가 주는 임의 키 중 알라딘 인물(역자) 페이지 URL 스캔."""
     for k, v in auth.items():
         if not isinstance(v, str) or "aladin.co.kr" not in v:
             continue
@@ -80,7 +142,6 @@ def _author_dict_extra_link(auth: dict) -> Optional[str]:
 
 
 def extract_translators_from_item(item: dict) -> List[dict]:
-    """역자 목록: 이름, authorId, API 제공 링크, 원시 author 엔트리."""
     out: List[dict] = []
     raw_author = item.get("author") or ""
     authors_list = (item.get("subInfo") or {}).get("authors") or []
@@ -89,7 +150,7 @@ def extract_translators_from_item(item: dict) -> List[dict]:
         if not isinstance(auth, dict):
             continue
         role = (auth.get("authorTypeDesc") or auth.get("authorTypeName") or "") + ""
-        if not any(k in role for k in ["옮긴이", "역자", "역", "옮김"]):
+        if not _role_is_translator(role):
             continue
         name = (auth.get("authorName") or "").strip()
         if not name:
@@ -133,7 +194,6 @@ def extract_translators_from_item(item: dict) -> List[dict]:
 
 
 def extract_writer_names_from_item(item: dict) -> List[str]:
-    """지은이(원저자) 이름 — 병행 조회용."""
     names: List[str] = []
     for auth in (item.get("subInfo") or {}).get("authors") or []:
         if not isinstance(auth, dict):
@@ -153,10 +213,6 @@ def extract_writer_names_from_item(item: dict) -> List[str]:
 
 
 def collect_biography_text(item: dict, translator_name: str) -> str:
-    """
-    ItemLookUp 부가정보에서 역자 소개 후보 텍스트 수집.
-    API 스펙에 따라 키가 다를 수 있어 authors 항목 전체 + 설명 필드를 훑음.
-    """
     chunks: List[str] = []
     sub = item.get("subInfo") or {}
     for auth in sub.get("authors") or []:
@@ -176,7 +232,6 @@ def collect_biography_text(item: dict, translator_name: str) -> str:
             val = auth.get(key)
             if isinstance(val, str) and val.strip():
                 chunks.append(val.strip())
-        # 나머지 문자열 필드 중 긴 텍스트
         for k, v in auth.items():
             if k in ("authorName", "authorId", "authorTypeDesc", "authorTypeName"):
                 continue
@@ -191,7 +246,9 @@ def collect_biography_text(item: dict, translator_name: str) -> str:
     return "\n\n".join(dict.fromkeys(chunks))
 
 
-# --- 동명이인: 카테고리 교차 필터 ---
+# ---------------------------------------------------------------------------
+# 동명이인: 카테고리 (대분류만 느슨하게)
+# ---------------------------------------------------------------------------
 
 
 def category_segments(cat: Optional[str]) -> List[str]:
@@ -201,56 +258,105 @@ def category_segments(cat: Optional[str]) -> List[str]:
     return [p.strip() for p in s.split(">") if p.strip()]
 
 
-def category_overlap_ok(target_cat: str, book_cat: str, min_depth_match: int = 1) -> bool:
-    """대분류~중분류 수준에서 겹치면 동일 역자 후보로 간주."""
+def category_overlap_loose(target_cat: str, book_cat: str) -> bool:
+    """대분류(첫 세그먼트)만 같으면 True. 한쪽이 비어 있으면 필터를 가리지 않음."""
     ta = category_segments(target_cat)
     ba = category_segments(book_cat)
     if not ta or not ba:
         return True
-    # 1-depth: 두 번째 세그먼트(예: 컴퓨터/모바일) 일치 우선
-    for i in range(min(min_depth_match + 1, len(ta), len(ba))):
-        if i < len(ta) and i < len(ba) and ta[i] == ba[i]:
-            return True
-    # 토큰 부분일치 (IT, 과학, 컴퓨터 등)
-    tail_t = " ".join(ta[:3]).lower()
-    tail_b = " ".join(ba[:3]).lower()
-    for token in ("컴퓨터", "모바일", "IT", "과학", "자연", "프로그래", "머신", "데이터", "수학", "물리"):
-        if token.lower() in tail_t and token.lower() in tail_b:
-            return True
-    return False
+    return ta[0] == ba[0]
 
 
-# --- 언어 / 원제 휴리스틱 ---
+# ---------------------------------------------------------------------------
+# authors 보강 (검색 응답에 역할 정보가 없을 때)
+# ---------------------------------------------------------------------------
 
 
-COUNTRY_LANG_HINTS = [
-    (r"영국|영어|영문|미국|American|English", "영어권"),
-    (r"일본|日|ジャパン", "일본"),
-    (r"중국|中文|汉语", "중국"),
-    (r"프랑스|프랑스어|French", "프랑스"),
-    (r"독일|German|Deutsch", "독일"),
-    (r"이탈리아|Italian", "이탈리아"),
-    (r"스페인|Spanish|Español", "스페인"),
-    (r"러시아|Russian", "러시아"),
-    (r"한국|국내", "한국"),
+def enrich_catalog_with_authors_lookup(
+    books: List[dict], ttbkey: str, target_name: str, max_lookups: int = 25
+) -> List[dict]:
+    out: List[dict] = []
+    lookups = 0
+    for b in books:
+        if is_translator_role(b, target_name):
+            out.append(b)
+            continue
+        if lookups >= max_lookups:
+            continue
+        isbn = (b.get("isbn13") or b.get("isbn") or "").replace("-", "").strip()
+        if len(isbn) != 13:
+            continue
+        try:
+            data = item_lookup_minimal(isbn, ttbkey)
+            lookups += 1
+        except (requests.RequestException, KeyError, ValueError):
+            continue
+        items = data.get("item") or []
+        if not items:
+            continue
+        merged = {**b, "subInfo": {**(b.get("subInfo") or {}), **(items[0].get("subInfo") or {})}}
+        if is_translator_role(merged, target_name):
+            out.append(merged)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 원제 문자 체계 · 메타 휴리스틱
+# ---------------------------------------------------------------------------
+
+RE_KANA = re.compile(r"[\u3040-\u309F\u30A0-\u30FF]")
+RE_HAN = re.compile(r"[\u4E00-\u9FFF]")
+RE_LATIN = re.compile(r"[A-Za-z]")
+
+
+COUNTRY_LANG_HINTS: List[Tuple[str, str]] = [
+    (r"영국|영어|영문|미국|American|English", "메타_영어권"),
+    (r"일본|日|ジャパン", "메타_일본"),
+    (r"중국|中文|汉语", "메타_중국"),
+    (r"프랑스|프랑스어|French", "메타_프랑스"),
+    (r"독일|German|Deutsch", "메타_독일"),
+    (r"이탈리아|Italian", "메타_이탈리아"),
+    (r"스페인|Spanish|Español", "메타_스페인"),
+    (r"러시아|Russian|俄", "메타_러시아"),
+    (r"한국|국내", "메타_한국"),
 ]
+
+
+def _script_weights_on_text(text: str) -> Dict[str, float]:
+    w: Dict[str, float] = {}
+    if not text:
+        return w
+    if RE_KANA.search(text):
+        w["원제_가나(일본어)"] = w.get("원제_가나(일본어)", 0.0) + 2.0
+    if RE_HAN.search(text):
+        w["원제_한자(중국어)"] = w.get("원제_한자(중국어)", 0.0) + 1.0
+        w["원제_한자(일본어)"] = w.get("원제_한자(일본어)", 0.0) + 1.0
+    if RE_LATIN.search(text):
+        w["원제_라틴(영미·유럽권)"] = w.get("원제_라틴(영미·유럽권)", 0.0) + 1.5
+    return w
 
 
 def infer_signals_from_book(book: dict) -> Dict[str, Any]:
     title = (book.get("title") or "") + " " + (book.get("description") or "")
     sub = book.get("subInfo") or {}
-    ot = sub.get("originalTitle") or sub.get("subTitle") or ""
+    ot = (sub.get("originalTitle") or sub.get("subTitle") or "").strip()
     blob = f"{title} {ot}"
-    hints: List[str] = []
+
+    hint_weights: MutableMapping[str, float] = defaultdict(float)
     for pat, label in COUNTRY_LANG_HINTS:
         if re.search(pat, blob, re.I):
-            hints.append(label)
-    # 라틴 문자 비율이 높은 원제 → 영어 추정 보조
-    if ot and re.search(r"[A-Za-z]{4,}", ot) and not re.search(r"[가-힣]", ot):
-        hints.append("원제_라틴_문자(영어 가능)")
+            hint_weights[label] += 1.0
+
+    script_src = ot if ot else title
+    for k, v in _script_weights_on_text(script_src).items():
+        hint_weights[k] += v
+
+    if ot and RE_LATIN.search(ot) and not re.search(r"[가-힣]", ot):
+        hint_weights["원제_라틴_보조(영어 가능)"] += 0.5
+
     return {
         "originalTitle": ot or None,
-        "hints": list(dict.fromkeys(hints)),
+        "hint_weights": dict(hint_weights),
         "categoryName": book.get("categoryName"),
         "publisher": book.get("publisher"),
     }
@@ -260,60 +366,97 @@ def weighted_hint_counts(
     books: List[dict], target_publisher: str
 ) -> Tuple[Dict[str, float], List[dict]]:
     counts: Dict[str, float] = {}
-    rows = []
+    rows: List[dict] = []
     tp = (target_publisher or "").strip()
     for b in books:
         sig = infer_signals_from_book(b)
-        w = PUBLISHER_WEIGHT if tp and (b.get("publisher") or "").strip() == tp else 1.0
-        row = {"title": b.get("title"), "weight": w, **sig}
+        pub_w = PUBLISHER_WEIGHT if tp and (b.get("publisher") or "").strip() == tp else 1.0
+        row = {
+            "title": b.get("title"),
+            "weight": pub_w,
+            **sig,
+        }
         rows.append(row)
-        for h in sig["hints"]:
-            counts[h] = counts.get(h, 0.0) + w
+        for label, score in sig["hint_weights"].items():
+            counts[label] = counts.get(label, 0.0) + float(score) * pub_w
     return counts, rows
 
 
-# --- 학력: Regex → LLM ---
+# ---------------------------------------------------------------------------
+# 전공 → 언어 (Regex 보조 + LLM)
+# ---------------------------------------------------------------------------
+
+_MAJOR_LANG_RULES: List[Tuple[str, str]] = [
+    (r"노어|러시아|슬라브", "러시아어"),
+    (r"영미|영어|미국문학|영문", "영어"),
+    (r"불어|프랑스", "프랑스어"),
+    (r"독어|독일", "독일어"),
+    (r"스페인|스페인어|히스패닉", "스페인어"),
+    (r"이탈리아|이태리", "이탈리아어"),
+    (r"일본|일어", "일본어"),
+    (r"중국|중문|한문|중어", "중국어"),
+    (r"아랍|터키|페르시아|이란", "아랍어권·중동어권"),
+    (r"노르웨이|스웨덴|덴마크|북유럽", "북유럽어권"),
+    (r"라틴아메리카|포르투갈|브라질", "포르투갈어"),
+    (r"한국어|국어국문", "한국어"),
+]
 
 
-def extract_univ_major_regex(text: str) -> Optional[Dict[str, str]]:
+def infer_language_from_major_text(major: Optional[str]) -> Optional[str]:
+    if not major:
+        return None
+    m = major.strip()
+    for pat, lang in _MAJOR_LANG_RULES:
+        if re.search(pat, m, re.I):
+            return lang
+    return None
+
+
+def extract_univ_major_regex(text: str) -> Optional[Dict[str, Optional[str]]]:
     if not text or not text.strip():
         return None
-    # 예: OO대학교 컴퓨터공학과, OO대 전자공학과
     m = re.search(
         r"([가-힣A-Za-z·\s]{2,30}(?:대학교|대학|대))\s*([가-힣A-Za-z·\s]{2,20}(?:학과|전공|학부))",
         text,
     )
-    if m:
-        return {"university": m.group(1).strip(), "major": m.group(2).strip()}
-    m2 = re.search(
-        r"([가-힣A-Za-z·\s]{2,30}(?:대학교|대학|대))\s*에서\s*([가-힣A-Za-z·\s]{2,20}(?:학과|전공|학부))",
-        text,
-    )
-    if m2:
-        return {"university": m2.group(1).strip(), "major": m2.group(2).strip()}
-    return None
+    if not m:
+        m = re.search(
+            r"([가-힣A-Za-z·\s]{2,30}(?:대학교|대학|대))\s*에서\s*([가-힣A-Za-z·\s]{2,20}(?:학과|전공|학부))",
+            text,
+        )
+    if not m:
+        return None
+    uni, maj = m.group(1).strip(), m.group(2).strip()
+    inferred = infer_language_from_major_text(maj)
+    return {
+        "university": uni,
+        "major": maj,
+        "inferred_language": inferred,
+    }
 
 
-def extract_univ_major_llm(text: str, api_key: str) -> Optional[Dict[str, str]]:
+def extract_univ_major_llm(
+    text: str, api_key: str
+) -> Optional[Dict[str, Optional[str]]]:
     if not api_key or not text.strip():
         return None
+    system = (
+        "You read Korean biographies of translators. "
+        "Extract university, major, AND infer the primary source language they most likely "
+        "translate from, based on the major name (e.g. 노어노문학과 → 러시아어, 영어영문학과 → 영어). "
+        "Use concise Korean language names for inferred_language (e.g. 러시아어, 영어, 일본어, 독일어, 중국어). "
+        "If impossible, use null. "
+        'Reply JSON only: {"university": string|null, "major": string|null, "inferred_language": string|null}'
+    )
+    body = {
+        "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text[:8000]},
+        ],
+        "response_format": {"type": "json_object"},
+    }
     try:
-        import urllib.request
-
-        body = {
-            "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You extract only university name and major from Korean biography text. Reply JSON: {\"university\": string|null, \"major\": string|null}",
-                },
-                {
-                    "role": "user",
-                    "content": text[:8000],
-                },
-            ],
-            "response_format": {"type": "json_object"},
-        }
         req = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -327,28 +470,136 @@ def extract_univ_major_llm(text: str, api_key: str) -> Optional[Dict[str, str]]:
             data = json.loads(resp.read().decode("utf-8"))
         raw = data["choices"][0]["message"]["content"]
         obj = json.loads(raw)
-        u, mj = obj.get("university"), obj.get("major")
-        if u or mj:
-            return {
-                "university": (u or "").strip() or "",
-                "major": (mj or "").strip() or "",
-            }
-    except Exception:
+        u = obj.get("university")
+        mj = obj.get("major")
+        inf = obj.get("inferred_language")
+        return {
+            "university": (u or "").strip() or None,
+            "major": (mj or "").strip() or None,
+            "inferred_language": (inf or "").strip() or None,
+        }
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError):
         return None
-    return None
 
 
-# --- UI ---
+# ---------------------------------------------------------------------------
+# 최종 원서 언어 판정
+# ---------------------------------------------------------------------------
 
+
+def _collapse_career_hints(hints: Mapping[str, float]) -> Dict[str, float]:
+    collapsed: Dict[str, float] = defaultdict(float)
+    for label, score in hints.items():
+        if score <= 0:
+            continue
+        if label.startswith("메타_"):
+            w = score * 0.6
+            if "일본" in label:
+                collapsed["일본어"] += w
+            elif "중국" in label:
+                collapsed["중국어"] += w
+            elif "영어" in label:
+                collapsed["영어"] += w
+            elif "프랑스" in label:
+                collapsed["프랑스어"] += w
+            elif "독일" in label:
+                collapsed["독일어"] += w
+            elif "스페인" in label:
+                collapsed["스페인어"] += w
+            elif "이탈리아" in label:
+                collapsed["이탈리아어"] += w
+            elif "러시아" in label:
+                collapsed["러시아어"] += w
+            elif "한국" in label:
+                collapsed["한국어"] += w
+            continue
+        if "가나" in label:
+            collapsed["일본어"] += score
+        elif "한자(중국" in label:
+            collapsed["중국어"] += score
+        elif "한자(일본" in label:
+            collapsed["일본어"] += score
+        elif "라틴" in label or "영미" in label or "영어" in label:
+            collapsed["영어"] += score
+        elif "프랑스" in label:
+            collapsed["프랑스어"] += score
+        elif "독일" in label:
+            collapsed["독일어"] += score
+        elif "스페인" in label:
+            collapsed["스페인어"] += score
+        elif "이탈리아" in label:
+            collapsed["이탈리아어"] += score
+        elif "러시아" in label:
+            collapsed["러시아어"] += score
+        elif "한국" in label:
+            collapsed["한국어"] += score
+        elif "중동" in label or "아랍" in label:
+            collapsed["아랍어권"] += score
+        elif "북유럽" in label:
+            collapsed["북유럽어권"] += score
+        elif "포르투갈" in label:
+            collapsed["포르투갈어"] += score
+    return dict(collapsed)
+
+
+def determine_final_language(
+    inferred_from_major: Optional[str],
+    career_hints: Mapping[str, float],
+) -> Dict[str, Any]:
+    tier = 3
+    reason = "커리어·전공 단서 부족"
+    conclusion = "판별 불가"
+    major_s = (inferred_from_major or "").strip()
+    if major_s:
+        return {
+            "conclusion": major_s,
+            "tier": 1,
+            "reason": "전공(소개) 기반 추론 언어",
+            "career_runner_up": None,
+            "raw_career_collapse": _collapse_career_hints(career_hints),
+        }
+
+    collapsed = _collapse_career_hints(career_hints)
+    if collapsed:
+        best_lang, best_score = max(collapsed.items(), key=lambda kv: kv[1])
+        if best_score > 0:
+            conclusion = best_lang
+            tier = 2
+            reason = "필터링된 커리어 도서 메타·원제 문자 힌트 가중 합산"
+            return {
+                "conclusion": conclusion,
+                "tier": tier,
+                "reason": reason,
+                "career_runner_up": collapsed,
+                "raw_career_collapse": collapsed,
+            }
+
+    return {
+        "conclusion": conclusion,
+        "tier": tier,
+        "reason": reason,
+        "career_runner_up": None,
+        "raw_career_collapse": collapsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="알라딘 번역가 분석", layout="wide")
-st.title("알라딘 번역가 · 커리어 · 동명이인 필터")
+st.title("알라딘 번역가 · 커리어 · 원서 언어 추론")
 
 with st.sidebar:
     st.markdown("**옵션**")
-    use_category_filter = st.checkbox("카테고리 교차 필터(동명이인)", value=True)
+    use_category_filter = st.checkbox(
+        "대분류 카테고리 필터(동명이인, 느슨)", value=True
+    )
+    enrich_missing_authors = st.checkbox(
+        "authors 누락 시 ISBN LookUp으로 보강(느림, 호출↑)", value=False
+    )
     openai_key = st.text_input(
-        "OpenAI API 키(선택, 학력 LLM 단계)",
+        "OpenAI API 키(선택, 전공·언어 LLM)",
         type="password",
         value=os.environ.get("OPENAI_API_KEY", ""),
     )
@@ -406,70 +657,101 @@ if submitted:
                                     }
                                 )
                             with c2:
-                                st.markdown("**지은이(원저자) — 표기만 (별도 50권 검색 없음)**")
+                                st.markdown("**지은이(원저자) — 참고**")
                                 st.write(writers or "(없음)")
 
                             bio_text = collect_biography_text(item, tr["name"])
-                            st.markdown("**역자 소개 후보 텍스트 (ItemLookUp OptResult)**")
+                            st.markdown("**역자 소개 후보 (ItemLookUp)**")
+                            inferred_major_lang: Optional[str] = None
+                            education_block: Optional[Dict[str, Optional[str]]] = None
+
                             if bio_text:
-                                st.text_area("biography_raw", bio_text[:4000], height=160, key=f"bio_{tr['name']}")
+                                st.text_area(
+                                    "biography_raw",
+                                    bio_text[:4000],
+                                    height=160,
+                                    key=f"bio_{tr['name']}",
+                                )
                                 reg = extract_univ_major_regex(bio_text)
                                 if reg:
-                                    st.info(f"1단계 Regex: {reg}")
-                                elif openai_key:
-                                    with st.spinner("2단계 LLM…"):
+                                    st.info(f"1단계 Regex: `{reg}`")
+                                    education_block = reg
+                                    inferred_major_lang = reg.get("inferred_language")
+                                if openai_key.strip():
+                                    with st.spinner("LLM: 전공 + 원서 언어 추론…"):
                                         llm = extract_univ_major_llm(bio_text, openai_key.strip())
                                     if llm:
-                                        st.info(f"2단계 LLM JSON: {llm}")
-                                    else:
-                                        st.caption("LLM에서 학력을 추출하지 못했습니다.")
-                                else:
-                                    st.caption("Regex 실패 시 OpenAI 키를 넣으면 LLM 단계가 동작합니다.")
+                                        st.info(f"LLM: `{llm}`")
+                                        education_block = llm
+                                        inf = llm.get("inferred_language")
+                                        if inf:
+                                            inferred_major_lang = inf
+                                elif not reg:
+                                    st.caption("Regex 실패 시 OpenAI 키로 LLM 단계를 쓸 수 있습니다.")
                             else:
-                                st.caption(
-                                    "이 응답에는 역자 전용 biography 필드가 비어 있을 수 있습니다. "
-                                    "authors 항목에 추가 키가 오는 경우가 있으며, 그때 자동 수집됩니다."
-                                )
+                                st.caption("역자 소개 텍스트가 비어 있을 수 있습니다.")
 
                             with st.spinner(
-                                "역자명 기준 ItemSearch(QueryType=Author) 최대 50권…"
+                                "역자명 ItemSearch (OptResult=authors) 최대 50권…"
                             ):
                                 author_json = item_search_translator_catalog(
                                     tr["name"], ttb_key, 50
                                 )
 
-                            raw_list = author_json.get("item") or []
+                            raw_list: List[dict] = author_json.get("item") or []
                             st.markdown(
-                                f"**역자 검색 결과(커리어)**: {len(raw_list)}권 "
-                                f"(MaxResults=50, Query=`{tr['name']}`)"
+                                f"**역자 검색 원본**: {len(raw_list)}권 "
+                                f"(Query=`{tr['name']}`)"
                             )
 
-                            filtered = list(raw_list)
-                            if use_category_filter and target_cat:
-                                filtered = [
-                                    b
-                                    for b in raw_list
-                                    if category_overlap_ok(
-                                        target_cat, b.get("categoryName") or ""
+                            n_role_raw = sum(
+                                1 for b in raw_list if is_translator_role(b, tr["name"])
+                            )
+                            work_list: List[dict] = list(raw_list)
+                            if enrich_missing_authors and n_role_raw < max(1, len(raw_list)) * 0.3:
+                                with st.spinner("ISBN LookUp으로 authors 보강(제한)…"):
+                                    work_list = enrich_catalog_with_authors_lookup(
+                                        raw_list, ttb_key, tr["name"], max_lookups=25
                                     )
-                                ]
                                 st.caption(
-                                    f"카테고리 필터 후 **{len(filtered)}**권 "
-                                    f"(기준: `{target_cat[:60]}…`)"
+                                    f"보강 후 `is_translator_role` 통과 후보: **{len(work_list)}**권 "
+                                    f"(원본 대비 역자 명시 적을 때만 보강)"
                                 )
 
+                            filtered = [
+                                b
+                                for b in work_list
+                                if is_translator_role(b, tr["name"])
+                                and (
+                                    not use_category_filter
+                                    or category_overlap_loose(
+                                        target_cat, b.get("categoryName") or ""
+                                    )
+                                )
+                            ]
+                            n_role_work = sum(
+                                1 for b in work_list if is_translator_role(b, tr["name"])
+                            )
+                            st.caption(
+                                f"`is_translator_role` 통과: **{n_role_work}**권 / 작업 목록 "
+                                f"**{len(work_list)}**권 → 최종 필터 후 **{len(filtered)}**권"
+                            )
+
                             counts, detail_rows = weighted_hint_counts(filtered, target_pub)
-                            st.markdown("**언어·국가 힌트 (가중치: 동일 출판사 배수)**")
+                            st.markdown("**커리어 언어·원제 힌트 (출판사 가중 반영)**")
                             st.json(dict(sorted(counts.items(), key=lambda x: -x[1])))
 
-                            with st.expander("필터 적용 도서 목록(요약)"):
+                            with st.expander("필터 통과 도서 요약"):
                                 st.dataframe(
                                     [
                                         {
                                             "title": r["title"],
                                             "publisher": r.get("publisher"),
                                             "weight": r["weight"],
-                                            "hints": ", ".join(r.get("hints") or []),
+                                            "hints": json.dumps(
+                                                r.get("hint_weights") or {},
+                                                ensure_ascii=False,
+                                            ),
                                             "originalTitle": r.get("originalTitle"),
                                         }
                                         for r in detail_rows[:50]
@@ -477,7 +759,46 @@ if submitted:
                                     use_container_width=True,
                                 )
 
-                            with st.expander("API 디버그: 역자 authors 원시 JSON"):
+                            final = determine_final_language(inferred_major_lang, counts)
+
+                            st.markdown("---")
+                            st.subheader("최종 원서 언어 판정")
+                            if final["tier"] <= 2:
+                                st.success(
+                                    f"**원서 언어 추정:** {final['conclusion']} "
+                                    f"({final['tier']}순위 근거 — {final['reason']})"
+                                )
+                            else:
+                                st.warning(
+                                    f"**원서 언어:** {final['conclusion']} — {final['reason']}"
+                                )
+                            cols = st.columns([2, 1, 1])
+                            with cols[0]:
+                                st.metric(
+                                    label="결론 (원서 언어)",
+                                    value=final["conclusion"],
+                                )
+                            with cols[1]:
+                                st.metric(label="근거 단계", value=f"{final['tier']}순위")
+                            with cols[2]:
+                                st.caption(final["reason"])
+
+                            if final.get("career_runner_up"):
+                                st.success(
+                                    f"2순위 세부 축: `{final['career_runner_up']}`"
+                                )
+
+                            with st.expander("판정 상세 JSON"):
+                                st.json(
+                                    {
+                                        "education_extraction": education_block,
+                                        "inferred_from_major": inferred_major_lang,
+                                        "career_hint_weights": counts,
+                                        "final": final,
+                                    }
+                                )
+
+                            with st.expander("API 디버그: 현재 도서 역자 authors"):
                                 st.json(
                                     [
                                         a
