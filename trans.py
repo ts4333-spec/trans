@@ -116,7 +116,16 @@ def step3_verification(ttb_key: str, translator_name: str, target_category: str)
             book_cat = book.get("categoryName", "")
             if main_category in book_cat:
                 filtered_books.append(book)
+                
+        # 💡 [핵심 추가 로직] 
+        # 같은 카테고리로 필터링했더니 남는 책이 0권이라면?
+        # 차선책으로 필터링 전의 '검색된 전체 도서(items)'를 반환합니다.
+        if not filtered_books and items:
+            st.info("💡 타겟 분야의 과거 이력이 부족하여, 역자의 전체 번역 이력을 바탕으로 추론합니다.")
+            return items 
+            
         return filtered_books
+        
     except Exception as e:
         st.warning(f"[검증 단계 에러] {str(e)}")
         return []
