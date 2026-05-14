@@ -225,4 +225,5 @@ if submit and ttb_key and isbn:
                 st.write(f"- 신뢰도: {result['confidence']}")
                 st.write(f"- 판단 근거: {result['reason']}")
                 with st.expander("세부 통계 보기"):
-                    st.json(result['stats'])
+    # stats 키가 없으면 빈 딕셔너리 {}를 반환하여 에러 방지
+    st.json(result.get('stats', {}))
