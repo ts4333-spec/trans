@@ -1,13 +1,14 @@
 """
-알라딘 TTB: ISBN으로 번역가 식별 → Author 검색(최대 50권) → 카테고리 교차 필터·출판사 가중 →
-원제/언어 휴리스틱, 저자(지은이) 병행 조회, 역자 소개는 Regex → (선택) LLM JSON 구조화.
+알라딘 TTB: ISBN으로 역자 식별(ItemLookUp, 역자 Author ID) → ItemSearch QueryType=Author 로
+역자명 기준 최대 50권 커리어 → 카테고리 교차 필터·출판사 가중 → 원제/언어 휴리스틱.
+(알라딘 API에는 '역자 전용' 검색 타입이 없어 인물 검색은 QueryType=Author + 역자 표기명을 사용.)
+역자 소개: Regex → (선택) LLM JSON 구조화.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -44,11 +45,12 @@ def item_lookup(isbn_clean: str, ttbkey: str, opt_result: str = OPT_LOOKUP) -> d
     return _get_json(ITEM_LOOKUP, params)
 
 
-def item_search_author(author_name: str, ttbkey: str, max_results: int = 50) -> dict:
+def item_search_translator_catalog(translator_display_name: str, ttbkey: str, max_results: int = 50) -> dict:
+    """역자(번역가) 참여 도서 목록. 알라딘은 QueryType=Author 로 인물명 검색만 제공."""
     params = {
         "ttbkey": ttbkey.strip(),
         "QueryType": "Author",
-        "Query": author_name.strip(),
+        "Query": translator_display_name.strip(),
         "MaxResults": str(max_results),
         "start": "1",
         "SearchTarget": "Book",
@@ -58,7 +60,7 @@ def item_search_author(author_name: str, ttbkey: str, max_results: int = 50) -> 
     return _get_json(ITEM_SEARCH, params)
 
 
-# --- 번역가 / 저자 ID ---
+# --- 역자(번역가) / 역자 Author ID ---
 
 
 def aladin_author_page_url(author_id: Optional[int]) -> Optional[str]:
@@ -68,7 +70,7 @@ def aladin_author_page_url(author_id: Optional[int]) -> Optional[str]:
 
 
 def _author_dict_extra_link(auth: dict) -> Optional[str]:
-    """API가 주는 임의 키 중 저자 페이지 URL 스캔."""
+    """API가 주는 임의 키 중 알라딘 인물(역자) 페이지 URL 스캔."""
     for k, v in auth.items():
         if not isinstance(v, str) or "aladin.co.kr" not in v:
             continue
@@ -336,20 +338,6 @@ def extract_univ_major_llm(text: str, api_key: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def run_parallel_lookups(ttbkey: str, translator_name: str, writer_names: List[str]):
-    """번역가 저자검색 50 + (있으면) 지은이 저자검색 50 병행."""
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        fa = ex.submit(item_search_author, translator_name, ttbkey, 50)
-        fb = (
-            ex.submit(item_search_author, writer_names[0], ttbkey, 50)
-            if writer_names
-            else None
-        )
-        author50 = fa.result()
-        writer50 = fb.result() if fb else None
-    return author50, writer50
-
-
 # --- UI ---
 
 
@@ -409,16 +397,16 @@ if submitted:
                             st.success(f"번역가: **{tr['name']}**")
                             c1, c2 = st.columns(2)
                             with c1:
-                                st.markdown("**Author ID / 알라딘 저자 페이지**")
+                                st.markdown("**역자 Author ID · 알라딘 역자 페이지**")
                                 st.write(
                                     {
-                                        "authorId": tr.get("authorId"),
-                                        "url": tr.get("authorPageUrl")
+                                        "translatorAuthorId": tr.get("authorId"),
+                                        "translatorAuthorPageUrl": tr.get("authorPageUrl")
                                         or aladin_author_page_url(tr.get("authorId")),
                                     }
                                 )
                             with c2:
-                                st.markdown("**병행: 지은이(원저자)**")
+                                st.markdown("**지은이(원저자) — 표기만 (별도 50권 검색 없음)**")
                                 st.write(writers or "(없음)")
 
                             bio_text = collect_biography_text(item, tr["name"])
@@ -444,14 +432,17 @@ if submitted:
                                 )
 
                             with st.spinner(
-                                "병행 API: QueryType=Author 번역가 50권 + 지은이 50권…"
+                                "역자명 기준 ItemSearch(QueryType=Author) 최대 50권…"
                             ):
-                                author_json, writer_json = run_parallel_lookups(
-                                    ttb_key, tr["name"], writers
+                                author_json = item_search_translator_catalog(
+                                    tr["name"], ttb_key, 50
                                 )
 
                             raw_list = author_json.get("item") or []
-                            st.markdown(f"**저자 검색 원본**: {len(raw_list)}권 (MaxResults=50)")
+                            st.markdown(
+                                f"**역자 검색 결과(커리어)**: {len(raw_list)}권 "
+                                f"(MaxResults=50, Query=`{tr['name']}`)"
+                            )
 
                             filtered = list(raw_list)
                             if use_category_filter and target_cat:
@@ -485,20 +476,6 @@ if submitted:
                                     ],
                                     use_container_width=True,
                                 )
-
-                            if writer_json and writer_json.get("item"):
-                                with st.expander("지은이(원저자) 검색 50권 — 참고"):
-                                    st.dataframe(
-                                        [
-                                            {
-                                                "title": x.get("title"),
-                                                "publisher": x.get("publisher"),
-                                                "categoryName": x.get("categoryName"),
-                                            }
-                                            for x in (writer_json.get("item") or [])[:20]
-                                        ],
-                                        use_container_width=True,
-                                    )
 
                             with st.expander("API 디버그: 역자 authors 원시 JSON"):
                                 st.json(
