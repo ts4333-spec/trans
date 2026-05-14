@@ -86,6 +86,8 @@ def step2_5_profile_analysis(author_info_text: str) -> dict:
         elif "불어" in major or "불문" in major: lang_hint = "French"
         elif "일어" in major or "일문" in major: lang_hint = "Japanese"
         elif "영어" in major or "영문" in major: lang_hint = "English"
+        elif "중어" in major or "중문" in major: lang_hint = "Chinese"
+        elif "노어" in major or "노문" in major or "러시아" in major: lang_hint = "Russian"
 
     return {"university": university, "major": major, "lang_hint": lang_hint}
 
@@ -117,9 +119,7 @@ def step3_verification(ttb_key: str, translator_name: str, target_category: str)
             if main_category in book_cat:
                 filtered_books.append(book)
                 
-        # 💡 [핵심 추가 로직] 
-        # 같은 카테고리로 필터링했더니 남는 책이 0권이라면?
-        # 차선책으로 필터링 전의 '검색된 전체 도서(items)'를 반환합니다.
+        # 💡 [핵심 추가 로직] 타겟 카테고리가 없으면 역자의 전체 도서(items)를 반환
         if not filtered_books and items:
             st.info("💡 타겟 분야의 과거 이력이 부족하여, 역자의 전체 번역 이력을 바탕으로 추론합니다.")
             return items 
@@ -144,13 +144,20 @@ def step4_analysis(filtered_books: list, profile_lang_hint: str) -> Counter:
         cat = book.get("categoryName", "")
         title = book.get("title", "")
         
+        # 1. 카테고리 기반 언어 유추
         if any(k in cat for k in ["영미", "미국", "영국"]): lang_counter["English"] += 2
         elif "일본" in cat: lang_counter["Japanese"] += 2
         elif "프랑스" in cat: lang_counter["French"] += 2
         elif "독일" in cat: lang_counter["German"] += 2
+        elif "중국" in cat or "대만" in cat: lang_counter["Chinese"] += 2
+        elif "러시아" in cat: lang_counter["Russian"] += 2
             
+        # 2. 제목 정규식 유추 (알파벳 및 한자 감지)
         if re.search(r'[a-zA-Z]', title):
             lang_counter["English"] += 1
+            
+        if re.search(r'[\u4e00-\u9fff]', title):
+            lang_counter["Chinese"] += 1
             
     return lang_counter
 
@@ -228,6 +235,5 @@ if submit and ttb_key and isbn:
                 st.write(f"- **신뢰도:** {result['confidence']}")
                 st.write(f"- **판단 근거:** {result['reason']}")
                 
-                # 에러 안 나는 안전한 expander
                 with st.expander("세부 통계 보기"):
                     st.json(result.get("stats", {}))
