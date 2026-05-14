@@ -131,33 +131,53 @@ def step3_verification(ttb_key: str, translator_name: str, target_category: str)
         return []
 
 # ==========================================
-# [4단계: 분석] 언어 힌트 통계 산출
+# [4단계: 분석] 언어 힌트 싹쓸이 통계 산출 (개선판)
 # ==========================================
 def step4_analysis(filtered_books: list, profile_lang_hint: str) -> Counter:
     lang_counter = Counter()
     
-    # 전공 언어 힌트가 있으면 강력한 가산점 부여
+    # 전공은 절대적인 힌트이므로 가중치 폭발 (5점 -> 20점)
     if profile_lang_hint:
-        lang_counter[profile_lang_hint] += 5
+        lang_counter[profile_lang_hint] += 20
         
     for book in filtered_books:
+        # 얌전하게 카테고리만 보던 과거는 버립니다.
+        # 카테고리, 제목, 원작자, 책 설명(description), 출판사까지 싹 다 하나의 텍스트로 합칩니다.
         cat = book.get("categoryName", "")
         title = book.get("title", "")
+        author = book.get("author", "")
+        desc = book.get("description", "")
         
-        # 1. 카테고리 기반 언어 유추
-        if any(k in cat for k in ["영미", "미국", "영국"]): lang_counter["English"] += 2
-        elif "일본" in cat: lang_counter["Japanese"] += 2
-        elif "프랑스" in cat: lang_counter["French"] += 2
-        elif "독일" in cat: lang_counter["German"] += 2
-        elif "중국" in cat or "대만" in cat: lang_counter["Chinese"] += 2
-        elif "러시아" in cat: lang_counter["Russian"] += 2
+        full_text = f"{cat} {title} {author} {desc}".lower()
+        
+        # 1. 아시아권 (중국/대만) 영혼까지 스캔
+        if any(k in full_text for k in ["중국", "대만", "베이징", "상하이", "홍콩", "칭화", "마윈", "텐센트", "알리바바"]):
+            lang_counter["Chinese"] += 5
+        if re.search(r'[\u4e00-\u9fff]', full_text): # 텍스트 어디든 한자가 하나라도 있으면
+            lang_counter["Chinese"] += 2
             
-        # 2. 제목 정규식 유추 (알파벳 및 한자 감지)
+        # 2. 일본
+        if any(k in full_text for k in ["일본", "도쿄", "오사카", "아마존재팬"]):
+            lang_counter["Japanese"] += 5
+            
+        # 3. 영미권/유럽 스캔
+        if any(k in full_text for k in ["영미", "미국", "영국", "뉴욕", "아마존", "하버드", "실리콘밸리", "월스트리트"]):
+            lang_counter["English"] += 5
+        if "프랑스" in full_text or "파리" in full_text: lang_counter["French"] += 5
+        if "독일" in full_text or "베를린" in full_text: lang_counter["German"] += 5
+        if "러시아" in full_text or "모스크바" in full_text: lang_counter["Russian"] += 5
+            
+        # 4. 원작자(지은이) 이름 패턴 분석의 치트키
+        # 서양인 원작자는 보통 이름에 띄어쓰기(' ')나 가운뎃점('·')이 들어갑니다. (예: 리처드·도킨스)
+        author_match = re.search(r'([^,]+?)\s*\(지은이\)', author)
+        if author_match:
+            orig_author = author_match.group(1).strip()
+            if ' ' in orig_author or '·' in orig_author or '.' in orig_author:
+                lang_counter["English"] += 3  # 서양인 이름 패턴 감지!
+                
+        # 5. 영어 알파벳 감지 (알파벳은 여기저기 많으니 가중치 1점만)
         if re.search(r'[a-zA-Z]', title):
             lang_counter["English"] += 1
-            
-        if re.search(r'[\u4e00-\u9fff]', title):
-            lang_counter["Chinese"] += 1
             
     return lang_counter
 
