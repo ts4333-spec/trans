@@ -356,7 +356,7 @@ def run_parallel_lookups(ttbkey: str, translator_name: str, writer_names: List[s
 st.set_page_config(page_title="알라딘 번역가 분석", layout="wide")
 st.title("알라딘 번역가 · 커리어 · 동명이인 필터")
 
-with st.sidebar():
+with st.sidebar:
     st.markdown("**옵션**")
     use_category_filter = st.checkbox("카테고리 교차 필터(동명이인)", value=True)
     openai_key = st.text_input(
