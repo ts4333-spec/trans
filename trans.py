@@ -206,7 +206,7 @@ def category_overlap_ok(target_cat: str, book_cat: str, min_depth_match: int = 1
     if not ta or not ba:
         return True
     # 1-depth: 두 번째 세그먼트(예: 컴퓨터/모바일) 일치 우선
-    for i in range(min(min_depth_match + 1, len(ta), len(ba)))):
+    for i in range(min(min_depth_match + 1, len(ta), len(ba))):
         if i < len(ta) and i < len(ba) and ta[i] == ba[i]:
             return True
     # 토큰 부분일치 (IT, 과학, 컴퓨터 등)
