@@ -23,7 +23,6 @@ ITEM_LOOKUP = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
 ITEM_SEARCH = "http://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
 API_VERSION = "20131101"
 OPT_LOOKUP = "authors,categoryIdList,fulldescription,Story,toc"
-OPT_SEARCH = "authors"
 
 PUBLISHER_WEIGHT = 8.0
 
@@ -50,22 +49,80 @@ def _author_name_equals_target(target: str, author_name: str) -> bool:
     return target.strip() == (author_name or "").strip()
 
 
-def is_translator_role(book: dict, target_name: str) -> bool:
+def _fallback_translator_role_from_raw_author(raw_author: str, target_name: str) -> bool:
     """
-    subInfo.authors에서 target_name과 이름이 일치하고,
-    authorTypeDesc 또는 authorTypeName에 옮긴이/역자/역/옮김 중 하나가 포함되면 True.
+    ItemSearch 등에서 subInfo.authors가 비었을 때, book['author'] 한 줄에서
+    타겟 이름과 역자 표기가 같은 쉼표 구간에 묶였는지 Regex로 판별.
     """
-    for auth in (book.get("subInfo") or {}).get("authors") or []:
-        if not isinstance(auth, dict):
+    t = target_name.strip()
+    blob = (raw_author or "").strip()
+    if not t or not blob:
+        return False
+    esc = re.escape(t)
+
+    for chunk in re.split(r"\s*,\s*", blob):
+        ch = chunk.strip()
+        if t not in ch:
             continue
-        if not _author_name_equals_target(target_name, (auth.get("authorName") or "")):
+
+        # 이 구간이 "이름 (지은이|그림|…)"만 담당하면 역자로 보지 않음
+        if re.fullmatch(
+            rf"{esc}\s*\(\s*(?:지은이|지음|그림|편집|감수|일러스트|사진|촬영)\s*\)",
+            ch,
+            re.UNICODE,
+        ):
             continue
-        desc = (auth.get("authorTypeDesc") or "") + ""
-        name_t = (auth.get("authorTypeName") or "") + ""
-        role_blob = f"{desc} {name_t}"
-        if any(marker in role_blob for marker in _TRANSLATOR_MARKERS_FOR_CATALOG):
+
+        # 이름 직후 괄호 안에 역자 키워드
+        if re.search(
+            rf"{esc}\s*\([^)]*(?:옮긴이|역자|옮김|번역)[^)]*\)",
+            ch,
+            re.UNICODE,
+        ):
+            return True
+        # 이름 (역) — '역' 단독 역할
+        if re.search(rf"{esc}\s*\(\s*역\s*\)", ch, re.UNICODE):
+            return True
+        # 괄호 없이 "이름 옮김" 등
+        if re.search(
+            rf"{esc}\s+(?:옮긴이|역자|옮김|번역)(?=\s*(?:,|$))",
+            ch,
+            re.UNICODE,
+        ):
+            return True
+        # 유연 패턴: 이름 + 선택 '(' + … 역자 키워드 … + 선택 ')'
+        # '역'은 앞뒤가 비한글일 때만 (역사, 지은이 등 오탐 완화)
+        if re.search(
+            rf"{esc}\s*\(?[^)]*"
+            r"(?:옮긴이|역자|옮김|번역|(?<![가-힣])역(?![가-힣]))"
+            r"[^)]*\)?",
+            ch,
+            re.UNICODE,
+        ):
             return True
     return False
+
+
+def is_translator_role(book: dict, target_name: str) -> bool:
+    """
+    subInfo.authors가 있으면 구조화된 역할로 판별.
+    authors가 비었거나 없으면 book['author'] 원시 문자열 Regex 폴백.
+    """
+    sub = book.get("subInfo") or {}
+    authors = sub.get("authors")
+    if isinstance(authors, list) and len(authors) > 0:
+        for auth in authors:
+            if not isinstance(auth, dict):
+                continue
+            if not _author_name_equals_target(target_name, (auth.get("authorName") or "")):
+                continue
+            desc = (auth.get("authorTypeDesc") or "") + ""
+            name_t = (auth.get("authorTypeName") or "") + ""
+            role_blob = f"{desc} {name_t}"
+            if any(marker in role_blob for marker in _TRANSLATOR_MARKERS_FOR_CATALOG):
+                return True
+        return False
+    return _fallback_translator_role_from_raw_author(book.get("author") or "", target_name)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +161,7 @@ def item_search_translator_catalog(
         "SearchTarget": "Book",
         "output": "js",
         "Version": API_VERSION,
-        "OptResult": OPT_SEARCH,
+        "OptResult": "authors",
     }
     return _get_json(ITEM_SEARCH, params)
 
