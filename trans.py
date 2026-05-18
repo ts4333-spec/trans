@@ -318,7 +318,7 @@ def resolve_author_id_from_product_html(
 ) -> Optional[int]:
     """
     상품 페이지 HTML에서 역자 저자 링크(<a> 앵커 텍스트)가 이름과 정확히 일치할 때만
-    wauthor_overview AuthorSearch ID를 반환한다. 주변 텍스트 추측 매칭은 하지 않는다.
+    AuthorSearch 고유 ID를 반환한다. wauthor_overview / wsearchresult URL 모두 지원.
     """
     t = (translator_name or "").strip()
     if not t or not html:
@@ -326,8 +326,8 @@ def resolve_author_id_from_product_html(
 
     anchor_pat = re.compile(
         r'<a[^>]+href=["\']?(?:https?://(?:www\.)?aladin\.co\.kr)?'
-        r'/author/wauthor_overview\.aspx\?AuthorSearch='
-        r'(?:[^"\'&>]*?@)?(\d+)["\']?[^>]*>(.*?)</a>',
+        r'/(?:author/wauthor_overview|search/wsearchresult)\.aspx\?AuthorSearch='
+        r'(?:[^"\'&>]*?@)?(\d+)[^"\'<>]*?["\']?[^>]*>(.*?)</a>',
         re.I | re.S,
     )
     for m in anchor_pat.finditer(html):
