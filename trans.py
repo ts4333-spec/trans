@@ -317,12 +317,12 @@ def resolve_author_id_from_product_html(
     html: str, translator_name: str
 ) -> Optional[int]:
     """
-    상품 페이지 HTML에서 역자 이름과 매칭되는 wauthor_overview AuthorSearch ID 추출.
+    상품 페이지 HTML에서 역자 저자 링크(<a> 앵커 텍스트)가 이름과 정확히 일치할 때만
+    wauthor_overview AuthorSearch ID를 반환한다. 주변 텍스트 추측 매칭은 하지 않는다.
     """
     t = (translator_name or "").strip()
     if not t or not html:
         return None
-    esc = re.escape(t)
 
     anchor_pat = re.compile(
         r'<a[^>]+href=["\']?(?:https?://(?:www\.)?aladin\.co\.kr)?'
@@ -339,35 +339,7 @@ def resolve_author_id_from_product_html(
         text = re.sub(r"\s+", " ", text).strip()
         if _author_name_equals_target(t, text):
             return aid
-
-    link_pat = re.compile(
-        r"wauthor_overview\.aspx\?AuthorSearch=(?:[^\"'&>\s]*?@)?(\d+)",
-        re.I,
-    )
-    best_aid: Optional[int] = None
-    for m in link_pat.finditer(html):
-        try:
-            aid = int(m.group(1))
-        except (TypeError, ValueError):
-            continue
-        start = max(0, m.start() - 320)
-        end = min(len(html), m.end() + 160)
-        window = html[start:end]
-        if not re.search(esc, window):
-            continue
-        plain = re.sub(r"<[^>]+>", " ", window)
-        plain = re.sub(r"\s+", " ", plain)
-        if not re.search(esc, plain):
-            continue
-        if re.search(
-            rf"{esc}.{{0,50}}(?:옮긴이|역자|옮김|번역)|"
-            rf"(?:옮긴이|역자|옮김|번역).{{0,50}}{esc}",
-            plain,
-        ):
-            return aid
-        if best_aid is None:
-            best_aid = aid
-    return best_aid
+    return None
 
 
 def scrape_author_id_from_product_page(
