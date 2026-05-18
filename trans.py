@@ -22,6 +22,7 @@ import streamlit as st
 ITEM_LOOKUP = "http://www.aladin.co.kr/ttb/api/ItemLookUp.aspx"
 ITEM_SEARCH = "http://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
 ALADIN_WSEARCH = "https://www.aladin.co.kr/search/wsearchresult.aspx"
+ALADIN_WPRODUCT = "https://www.aladin.co.kr/shop/wproduct.aspx"
 WSEARCH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -286,6 +287,132 @@ def extract_translators_from_item(item: dict) -> List[dict]:
                         }
                     )
     return out
+
+
+def _product_page_item_id(item: dict, isbn_fallback: str = "") -> Optional[str]:
+    """도서 상세 웹페이지용 ItemId (API itemId 우선, 없으면 ISBN13)."""
+    for key in ("itemId", "item_id"):
+        v = item.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    isbn = (item.get("isbn13") or item.get("isbn") or isbn_fallback or "").replace(
+        "-", ""
+    ).strip()
+    return isbn or None
+
+
+def fetch_product_page_html(item_id: str) -> str:
+    headers = {"User-Agent": WSEARCH_USER_AGENT}
+    resp = requests.get(
+        ALADIN_WPRODUCT,
+        params={"ItemId": item_id},
+        headers=headers,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def resolve_author_id_from_product_html(
+    html: str, translator_name: str
+) -> Optional[int]:
+    """
+    상품 페이지 HTML에서 역자 이름과 매칭되는 wauthor_overview AuthorSearch ID 추출.
+    """
+    t = (translator_name or "").strip()
+    if not t or not html:
+        return None
+    esc = re.escape(t)
+
+    anchor_pat = re.compile(
+        r'<a[^>]+href=["\']?(?:https?://(?:www\.)?aladin\.co\.kr)?'
+        r'/author/wauthor_overview\.aspx\?AuthorSearch='
+        r'(?:[^"\'&>]*?@)?(\d+)["\']?[^>]*>(.*?)</a>',
+        re.I | re.S,
+    )
+    for m in anchor_pat.finditer(html):
+        try:
+            aid = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        text = re.sub(r"<[^>]+>", "", m.group(2))
+        text = re.sub(r"\s+", " ", text).strip()
+        if _author_name_equals_target(t, text):
+            return aid
+
+    link_pat = re.compile(
+        r"wauthor_overview\.aspx\?AuthorSearch=(?:[^\"'&>\s]*?@)?(\d+)",
+        re.I,
+    )
+    best_aid: Optional[int] = None
+    for m in link_pat.finditer(html):
+        try:
+            aid = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        start = max(0, m.start() - 320)
+        end = min(len(html), m.end() + 160)
+        window = html[start:end]
+        if not re.search(esc, window):
+            continue
+        plain = re.sub(r"<[^>]+>", " ", window)
+        plain = re.sub(r"\s+", " ", plain)
+        if not re.search(esc, plain):
+            continue
+        if re.search(
+            rf"{esc}.{{0,50}}(?:옮긴이|역자|옮김|번역)|"
+            rf"(?:옮긴이|역자|옮김|번역).{{0,50}}{esc}",
+            plain,
+        ):
+            return aid
+        if best_aid is None:
+            best_aid = aid
+    return best_aid
+
+
+def scrape_author_id_from_product_page(
+    item_id: str, translator_name: str
+) -> Optional[int]:
+    try:
+        html = fetch_product_page_html(item_id)
+    except requests.RequestException:
+        return None
+    return resolve_author_id_from_product_html(html, translator_name)
+
+
+def enrich_translators_author_id_from_web(
+    translators: List[dict],
+    item: dict,
+    isbn_fallback: str = "",
+) -> List[dict]:
+    """
+    authorId가 비어 있는 역자에 대해 도서 상세 페이지 HTML에서 ID를 보완한다.
+    """
+    pid = _product_page_item_id(item, isbn_fallback)
+    if not pid:
+        return translators
+    needs = [tr for tr in translators if tr.get("authorId") is None]
+    if not needs:
+        return translators
+
+    html: Optional[str] = None
+    for tr in needs:
+        if html is None:
+            try:
+                html = fetch_product_page_html(pid)
+            except requests.RequestException:
+                return translators
+        aid = resolve_author_id_from_product_html(html, tr["name"])
+        if aid is None:
+            continue
+        tr["authorId"] = aid
+        tr["authorPageUrl"] = aladin_author_page_url(aid)
+        role = (tr.get("role") or "").strip()
+        if role == "문자열파싱":
+            tr["role"] = "문자열파싱(웹크롤링ID보완)"
+        elif "웹크롤링ID보완" not in role:
+            tr["role"] = f"{role}(웹크롤링ID보완)" if role else "웹크롤링ID보완"
+    return translators
 
 
 def extract_writer_names_from_item(item: dict) -> List[str]:
@@ -723,6 +850,18 @@ if submitted:
                     target_cat = item.get("categoryName") or ""
                     target_pub = (item.get("publisher") or "").strip()
                     translators = extract_translators_from_item(item)
+                    if any(tr.get("authorId") is None for tr in translators):
+                        with st.spinner(
+                            "API에 AuthorId 없음 → 도서 페이지에서 역자 ID 보완(웹 크롤링)…"
+                        ):
+                            translators = enrich_translators_author_id_from_web(
+                                translators, item, isbn_clean
+                            )
+                        found = sum(1 for tr in translators if tr.get("authorId"))
+                        st.caption(
+                            f"웹 페이지 AuthorId 보완: **{found}**/{len(translators)}명 "
+                            f"(상품 ItemId=`{_product_page_item_id(item, isbn_clean)}`)"
+                        )
                     writers = extract_writer_names_from_item(item)
 
                     st.subheader("현재 도서")
@@ -867,6 +1006,14 @@ if submitted:
                                     )
                                 )
                             ]
+                            if use_category_filter and len(filtered) == 0 and work_list:
+                                st.warning(
+                                    "카테고리 필터를 적용하면 분석 대상이 0권이 되어, "
+                                    "필터를 임시 해제하고 분석을 진행합니다. "
+                                    "(동명이인 데이터가 섞여 있을 수 있습니다.)"
+                                )
+                                filtered = list(work_list)
+
                             n_role_work = sum(
                                 1 for b in work_list if is_translator_role(b, tr["name"])
                             )
